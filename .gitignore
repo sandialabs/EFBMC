@@ -1,0 +1,6 @@
+.DS_Store
+*_cache/
+*_files/
+.Rhistory
+*.asv
+.ipynb_checkpoints
