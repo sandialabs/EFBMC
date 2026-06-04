@@ -1,0 +1,434 @@
+---
+title: "EFBMC Example"
+output: html_document
+---
+
+Example R markdown notebook demonstrating workflow for EFBMC. We will demonstrate this method calibrating one experiment from a Z-machine experiment in which we want to know the parameters of the Equation of State Model of Platinum.
+
+Code locations for required R packages not on CRAN:
+
+1. [impala](https://github.com/sandialabs/rImpala)
+2. [mvBayes](https://github.com/sandialabs/mvBayesR)
+
+For questions please contact
+
+J. Derek Tucker\
+Statistical Sciences - 5573\
+jdtuck@sandia.gov\
+505-284-8415
+
+![](Logo.png)
+
+# Setup
+
+First we need to import the required packages and make a useful function for the data
+
+```{r imports, message=FALSE}
+library(impala)
+library(mvBayes)
+library(BASS)
+library(fdasrvf)
+library(bayesplot)
+library(coda)
+library(readr)
+library(interp)
+
+make_matrix <- function(df,rownames = NULL){
+  my_matrix <-  as.matrix(df)
+  if(!is.null(rownames))
+    rownames(my_matrix) = rownames
+  my_matrix
+}
+
+library(knitr)
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+```
+
+# Data Pre-Processing
+Next we load in the training data from the computer model and extract the simulation parameters. We will also set a path to save the results
+
+```{r data, cache=TRUE}
+data_path = '/Users/jdtuck/Documents/Data/zbmc'
+sim_time = read.table(file.path(data_path, 'PlatinumBMC_May2023', 'Vinet', 'build1','time.out'))
+sim_time = c(sim_time$V1)
+
+simulations = read_table(
+  file.path(
+    data_path,
+    'PlatinumBMC_May2023',
+    'Vinet',
+    'build1',
+    'lhs_10000bp_5500res.txt'
+  )
+)
+
+last_elem = 12
+a = c(3,4,5,6,7,8,9,10,11,12)
+sim_variables = simulations[, a]
+sim_variables = make_matrix(sim_variables)
+p = ncol(sim_variables)
+
+new_dir = file.path(data_path, 'PlatinumBMC_May2023', 'Vinet', 'impala_id_bass')
+ifelse(!dir.exists(file.path(new_dir)),
+       dir.create(file.path(new_dir)),
+       "Directory Exists")
+save_fn = file.path(new_dir, "platinum_exp_all")
+```
+
+Next we will load in the experiment we wish to calibrate
+
+```{r experiment, cache=TRUE}
+exp1 = read_table(
+    file.path(
+      data_path,
+      'PlatinumBMC_May2023',
+      'Vinet',
+      'suite',
+      'Z2765',
+      'Z2765S2AvgTrueTrim.dat'
+    ),
+    col_names = c("time", "vel")
+  )
+```
+For preprocesing we will interpolate the curves to 100 points. Reduces computational time. 
+```{r interpolate}
+M1 = 1
+N1 = 500
+M = 100
+time_new = seq(sim_time[M1], sim_time[N1], length.out = M)
+f_sim = matrix(0, M, nrow(simulations))
+for (i in 1:nrow(simulations)) {
+  tmp = as.numeric(simulations[i, (M1 + last_elem):(N1 + last_elem)])
+  f_sim[, i] = aspline(sim_time[M1:N1], tmp, time_new)$y
+}
+f_exp = aspline(exp1$time, exp1$vel, time_new)$y
+```
+
+Look at the original data with the experiment overlaid
+```{r plot_original}
+matplot(time_new, f_sim, type = "l", col = "gray")
+lines(time_new, f_exp, col = "black")
+legend(
+  x = 0,
+  y = 8,
+  legend = c("simulation", "experiment"),
+  col = c("gray", "black"),
+  lty = 1
+)
+```
+
+# Elastic Functional Alignment
+We will now align the computer model output to the experiment. We will need the aligned data `ftilde_train` and the shooting vectors `vv_train`. Additionally we will need the shooting vector for the experiment. In this case, since we are aligning to the experiment warping function will be identity ($\gamma_{id}$) and then the corresponding shooting vector `vv_obs`.
+
+There is the option of the parameter `lambda` in `multiple_align_functions` that restricts the amount of alignment. In some cases we will set this to a small value (e.g., 0.01) to remove heteroskedacity from the warping functions.
+
+```{r alignment, cache=TRUE}
+tt = seq(0, 1, length.out = M)
+warp_list = multiple_align_functions(
+  f_sim,
+  tt,
+  f_exp,
+  parallel = TRUE,
+  showplot = FALSE,
+  verbose = FALSE
+)
+gam_sim = warp_list$warping_functions
+vv_sim = gam_to_psi(warp_list$warping_functions)
+ftilde_sim = warp_list$fn
+
+vv_obs = gam_to_psi(seq(0, 1, length.out=M))
+gam_obs = seq(0, 1, length.out=M)
+ftilde_obs = f_exp
+```
+
+We will now plot the alignment results. First is the aligned functions. 
+```{r plot_alignment}
+matplot(tt, ftilde_sim, type = "l", col = "gray")
+lines(tt, ftilde_obs, col = "black")
+legend(
+  x = 0,
+  y = 8,
+  legend = c("simulation", "experiment"),
+  col = c("gray", "black"),
+  lty = 1
+)
+```
+
+Then the corresponding warping functions
+```{r plot_warping}
+matplot(tt, gam_sim, type = "l", col = "gray")
+lines(tt, gam_obs, col = "black")
+legend(
+  x = 0,
+  y = 8,
+  legend = c("simulation", "experiment"),
+  col = c("gray", "black"),
+  lty = 1
+)
+```
+
+and the corresponding shooting vectors
+
+```{r plot_shooting}
+matplot(tt, vv_sim, type = "l", col = "gray")
+lines(tt, vv_obs, col = "black")
+legend(
+  x = 0,
+  y = 8,
+  legend = c("simulation", "experiment"),
+  col = c("gray", "black"),
+  lty = 1
+)
+```
+
+# Surrogate Model Fitting
+Next, we will fit the BASS surrogate to the computer model and evaluate its performance. We use the `mvBayes` package due to its ability to introspect surrogates and their performance.
+
+The choice of `nBasis` here is made from exploratory data analysis. It can also be chosen based on the percentage of variance explained from the functional principal component analysis (fPCA) decomposition. The parameter in `mvBayes` do perform this is `propVarExplained`.
+
+```{r train_emulator, cache=TRUE}
+emu_ftilde = mvBayes(
+  bass,
+  sim_variables,
+  t(ftilde_sim),
+  idxSamplesArg="mcmc.use",
+  nCores=parallel::detectCores(logical = TRUE),
+  samplesExtract = function(bass_out) list(
+    residSD = sqrt(bass_out$s2)),
+  nBasis=7
+)
+
+emu_vv = mvBayes(
+  bass,
+  sim_variables,
+  t(vv_sim),
+  basisType="pns",
+  idxSamplesArg="mcmc.use",
+  nCores=parallel::detectCores(logical = TRUE),
+  samplesExtract = function(bass_out) list(
+    residSD = sqrt(bass_out$s2)
+  )
+)
+```
+
+We can examine the fit of the surrogate model by looking at `mvBayes` diagnostic plots. We want to examine the MSE and if it is reasonable as well as the $R^2$ value to make sure its high enough. Also we can use the lower right panel to see how much explained variance is contained in the 7 principal components.
+
+```{r plot_emu}
+plot(emu_ftilde)
+```
+
+We can also examine the fPCA decomposition to explore it more further if needed. We see that 7 components contain 99% of the explained variance
+```{r plot_basis}
+plot(emu_ftilde$basisInfo)
+```
+
+Lets evaluate the shooting vector emulator
+```{r plot_emu_vv}
+plot(emu_vv)
+```
+
+# Bayesian Model Calibration
+We will now set up `impala` to perform the calibration. First we need to setup the parameter names and bounds on the parameters. `impala` sets uniform priors on the parameters based on their bounds.
+
+```{r bounds}
+input_names = c('rho','B0','BP0','Y0','A','floort','sampt','dt','ucon','ulin')
+bounds = list()
+for (i in 1:p){
+  bounds[[input_names[i]]] = c(min(sim_variables[,i]), max(sim_variables[,i]))
+}
+```
+
+We will now set up the calibration object and add the experimental data for the aligned data and shooting vectors. `impala` is set up to run multiple chains and do annealing so we set up a temperature ladder of 20 chains. We also set the chains to run for 4000 samples with a burn in of 2000 samples. The last line runs the calibration.
+
+```{r calibration}
+setup = CalibSetup(bounds, cf_bounds)
+    
+model_ftilde = ModelmvBayes(emu_ftilde, input_names)
+model_vv = ModelmvBayes(emu_vv, input_names)
+
+setup = addVecExperiments(setup, t(ftilde_obs), model_ftilde, 0.001, 20, rep(1, M))
+setup = addVecExperiments(setup, t(vv_obs), model_vv, 0.01, 20, rep(1, M))
+
+setup = setTemperatureLadder(setup, 1.05 ^ (0:19))
+setup = setMCMC(setup, 4000, 2000, 1, 10)
+out_cal = calibPool(setup)
+```
+
+Next we will extract the parameters for the last 2000 samples and thin by 1. 
+
+```{r prediction}
+uu = seq(2000, 4000, 2)
+
+theta = tran_unif(out_cal$theta[uu, 1, ], setup$bounds_mat, names(setup$bounds))
+
+time_new = seq(0, 1, length.out = M)
+
+ftilde_pred_obs = evalm(setup$models[[1]], theta)
+vv_pred_obs = evalm(setup$models[[2]], theta)
+gam_pred_obs = v_to_gam(t(vv_pred_obs))
+
+```
+
+Now we will look at the likelihood and chains to make sure the MCMC chains are stable and have converged.
+
+```{r likelihood}
+plot(out_cal$llik, type="l", ylab="Log-Likelihood", xlab="Iteration")
+```
+
+Next we will look at convergence diagnostics of ESS and $\hat{R}$
+```{r}
+samps_coda = list()
+for (ii in 1:20){
+  samps_coda[[ii]] = mcmc(out_cal$theta[uu,ii,])
+}
+samps_coda_all = mcmc.list(samps_coda)
+effectiveSize(samps_coda_all) 
+```
+
+```{r}
+gelman.diag(samps_coda_all)
+```
+
+```{r samps}
+samps = data.frame(theta[c(1,2,3,4,5)])
+mcmc_trace(samps)
+```
+
+Examine the pair plot of the parameters. The diagonal contains the posterior distributions of the parameters. The off diagonal is the dependence. 
+
+```{r pair,  message=FALSE}
+p = mcmc_pairs(samps, off_diag_fun="hex", diag_fun = "dens")
+p
+```
+
+```{r hist}
+mcmc_hist(samps)
+```
+
+
+Next we are going to evaluate the surrogate model at the calibrate parameters for the entire posterior distribution. They gray curves are the computer model, blue curves are the calibrated surrogate curves, and black is the experiment.
+
+```{r plot_predictions}
+matplot(
+  time_new,
+  ftilde_sim,
+  type = "l",
+  col = "gray",
+  lty = 1
+)
+matplot(
+  time_new,
+  t(ftilde_pred_obs),
+  type = "l",
+  col = "lightblue",
+  lty = 1,
+  add = TRUE
+)
+lines(time_new, ftilde_obs, col = "black")
+legend(
+  "bottomright",
+  legend = c("simulation", "prediction", "experiment"),
+  col = c("gray", "lightblue", "black"),
+  lty = 1
+)
+
+matplot(
+  time_new,
+  vv_sim,
+  type = "l",
+  col = "gray",
+  lty = 1
+)
+matplot(
+  time_new,
+  t(vv_pred_obs),
+  type = "l",
+  col = "lightblue",
+  lty = 1,
+  add = TRUE
+)
+lines(time_new, vv_obs, col = "black")
+legend(
+  "bottomright",
+  legend = c("simulation", "prediction", "experiment"),
+  col = c("gray", "lightblue", "black"),
+  lty = 1
+)
+
+matplot(
+  time_new,
+  gam_sim,
+  type = "l",
+  col = "gray",
+  lty = 1
+)
+matplot(
+  time_new,
+  gam_pred_obs,
+  type = "l",
+  col = "lightblue",
+  lty = 1,
+  add = TRUE
+)
+lines(time_new, gam_obs, col = "black")
+legend(
+  "bottomright",
+  legend = c("simulation", "prediction", "experiment"),
+  col = c("gray", "lightblue", "black"),
+  lty = 1
+)
+```
+
+We then combine the outputs of the emulators via composition to look at in the original data space
+```{r plot_pred_original}
+obspred = matrix(0, M, length(uu))
+for (i in 1:length(uu)) {
+  obspred[, i] = warp_f_gamma(ftilde_pred_obs[i, ], time_new, invertGamma(gam_pred_obs[, i]))
+}
+
+matplot(
+    time_new,
+    f_sim,
+    type = "l",
+    col = "gray",
+    lty = 1
+  )
+matplot(
+  time_new,
+  obspred ,
+  type = "l",
+  col = "lightblue",
+  lty = 1,
+  add = TRUE
+)
+lines(time_new, f_exp, col = "black")
+legend(
+  "bottomright",
+  legend = c("simulation", "prediction", "experiment"),
+  col = c("gray", "lightblue", "black"),
+  lty = 1
+)
+```
+
+# Sensitivity Analysis
+We can also perform sensitivity analysis on the surrogate through `mvBayes` by doing the following. The BASS emulator has a closed form sobol indices and we will utilize that. `mvBayes` also provides the ability to monte carlo to determine the sobol indices.
+
+First we will look at the amplitude surrogate
+
+```{r sobol}
+out_ftilde = mvSobol(emu_ftilde)
+plot(out_ftilde, labels=input_names)
+```
+
+Next the phase surrogate
+
+```{r sobol_vv}
+out_vv = mvSobol(emu_vv, nMC=2^9)
+plot(out_vv, labels=input_names)
+```
+
+We can also look at sensitivity as a functional boxplot or waterfall plot
+```{r sobol_waterfall}
+plot(out_ftilde, labels=input_names, waterfall=TRUE)
+```
